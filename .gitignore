@@ -1,5 +1,4 @@
-silver/ 
-gold/ 
-raw/ 
-spark-warehouse/ 
-__pycache__/ 
+silver/
+raw/
+spark-warehouse/
+__pycache__/
