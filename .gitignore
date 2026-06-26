@@ -2,3 +2,10 @@ silver/
 raw/
 spark-warehouse/
 __pycache__/
+gold/aqe_off_200/
+gold/aqe_test_4/
+gold/aqe_test_8/
+gold/aqe_test_20/
+gold/aqe_test_200/
+gold/test_sans_broadcast/
+gold/test_avec_broadcast/
