@@ -180,4 +180,94 @@ usagers_clean.write.mode("overwrite") \
 print("✅ Silver écrit avec succès !")
 print("\n=== Ingestion terminée ===")
 
+# ══════════════════════════════════════════════════════════
+# ÉTAPE 4 — ANALYSES (Silver → Gold)
+# ══════════════════════════════════════════════════════════
+
+# Relire la couche silver
+print("\n=== Lecture Silver ===")
+caract_s    = spark.read.parquet(f"{SILVER}/caract")
+lieux_s     = spark.read.parquet(f"{SILVER}/lieux")
+vehicules_s = spark.read.parquet(f"{SILVER}/vehicules")
+usagers_s   = spark.read.parquet(f"{SILVER}/usagers")
+
+# ── ANALYSE 1 : Gravité par conditions météo (agrégation) ──
+print("\n=== Analyse 1 : Gravité par météo ===")
+# atm : 1=normale, 2=pluie légère, 3=pluie forte, 4=neige, 5=brouillard, etc.
+# grav : 1=indemne, 2=tué, 3=blessé hospitalisé, 4=blessé léger
+
+t0 = time.time()
+
+gravite_meteo = caract_s.join(usagers_s, "Num_Acc") \
+    .groupBy("atm") \
+    .agg(
+        F.count("*").alias("nb_victimes"),
+        F.round(F.avg("grav"), 2).alias("gravite_moyenne"),
+        F.sum(F.when(F.col("grav") == 2, 1).otherwise(0)).alias("nb_tues")
+    ) \
+    .orderBy("atm")
+
+t1 = time.time()
+print(f"Temps analyse 1 : {t1-t0:.2f}s")
+gravite_meteo.show(10)
+gravite_meteo.write.mode("overwrite").parquet(f"{GOLD}/gravite_meteo")
+
+# ── ANALYSE 2 : Jointure des 4 tables — profil complet ────
+print("\n=== Analyse 2 : Jointure 4 tables ===")
+
+t0 = time.time()
+
+# Broadcast de lieux (petite table) pour optimisation
+from pyspark.sql.functions import broadcast
+
+accidents_complets = caract_s \
+    .join(broadcast(lieux_s), "Num_Acc") \
+    .join(vehicules_s, "Num_Acc") \
+    .join(usagers_s, "Num_Acc")
+
+# Accidents mortels par type de route et luminosité
+accidents_mortels = accidents_complets \
+    .filter(F.col("grav") == 2) \
+    .groupBy("catr", "lum") \
+    .agg(F.count("*").alias("nb_tues")) \
+    .orderBy(F.desc("nb_tues"))
+
+t1 = time.time()
+print(f"Temps analyse 2 : {t1-t0:.2f}s")
+accidents_mortels.show(10)
+accidents_mortels.write.mode("overwrite").parquet(f"{GOLD}/accidents_mortels")
+
+# ── ANALYSE 3 : Classement des départements (window) ──────
+print("\n=== Analyse 3 : Classement départements (window) ===")
+from pyspark.sql.window import Window
+
+t0 = time.time()
+
+# Nombre d'accidents et tués par département
+dep_stats = caract_s.join(usagers_s, "Num_Acc") \
+    .groupBy("dep") \
+    .agg(
+        F.countDistinct("Num_Acc").alias("nb_accidents"),
+        F.sum(F.when(F.col("grav") == 2, 1).otherwise(0)).alias("nb_tues")
+    )
+
+# Window : rang par nb_accidents
+window_dep = Window.orderBy(F.desc("nb_accidents"))
+
+dep_classe = dep_stats \
+    .withColumn("rang", F.rank().over(window_dep)) \
+    .withColumn("taux_mortalite",
+        F.round(F.when(F.col("nb_accidents") > 0,
+            F.col("nb_tues") / F.col("nb_accidents") * 100
+        ).otherwise(0), 2)
+    ) \
+    .orderBy("rang")
+
+t1 = time.time()
+print(f"Temps analyse 3 : {t1-t0:.2f}s")
+dep_classe.show(15)
+dep_classe.write.mode("overwrite").parquet(f"{GOLD}/classement_departements")
+
+print("\n=== Analyses terminées, résultats écrits dans Gold ===")
+
 spark.stop()
