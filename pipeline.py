@@ -5,6 +5,8 @@ from pyspark.sql.types import (
     StringType, IntegerType, FloatType
 )
 import time
+import os
+
 
 # ── Session Spark ──────────────────────────────────────────
 spark = SparkSession.builder \
@@ -17,6 +19,8 @@ spark = SparkSession.builder \
     .getOrCreate()
 
 spark.sparkContext.setLogLevel("WARN")
+
+
 
 # Contournement winutils Windows
 spark.sparkContext._jsc.hadoopConfiguration().set(
@@ -269,5 +273,101 @@ dep_classe.show(15)
 dep_classe.write.mode("overwrite").parquet(f"{GOLD}/classement_departements")
 
 print("\n=== Analyses terminées, résultats écrits dans Gold ===")
+
+
+# ══════════════════════════════════════════════════════════
+# ÉTAPE 5 — OPTIMISATION MESURÉE
+# ══════════════════════════════════════════════════════════
+print("\n=== Optimisation : Broadcast Join ===")
+
+# -- SANS broadcast (sort-merge join par défaut)
+spark.conf.set("spark.sql.autoBroadcastJoinThreshold", "-1")  # désactive broadcast auto
+
+t0 = time.time()
+sans_broadcast = caract_s.join(lieux_s, "Num_Acc") \
+    .groupBy("dep", "catr") \
+    .agg(F.count("*").alias("nb")) \
+    .orderBy(F.desc("nb"))
+sans_broadcast.write.mode("overwrite").parquet(f"{GOLD}/test_sans_broadcast")
+t1 = time.time()
+temps_sans = t1 - t0
+print(f"Temps SANS broadcast : {temps_sans:.2f}s")
+
+# -- AVEC broadcast (lieux est petit ~54K lignes)
+spark.conf.set("spark.sql.autoBroadcastJoinThreshold", "10485760")  # réactive
+
+t0 = time.time()
+avec_broadcast = caract_s.join(broadcast(lieux_s), "Num_Acc") \
+    .groupBy("dep", "catr") \
+    .agg(F.count("*").alias("nb")) \
+    .orderBy(F.desc("nb"))
+avec_broadcast.write.mode("overwrite").parquet(f"{GOLD}/test_avec_broadcast")
+t1 = time.time()
+temps_avec = t1 - t0
+print(f"Temps AVEC broadcast : {temps_avec:.2f}s")
+print(f"Gain : {((temps_sans - temps_avec) / temps_sans * 100):.1f}%")
+
+# -- Plan d'exécution (pour le rapport)
+print("\n--- Plan SANS broadcast ---")
+caract_s.join(lieux_s, "Num_Acc").explain()
+print("\n--- Plan AVEC broadcast ---")
+caract_s.join(broadcast(lieux_s), "Num_Acc").explain()
+
+# ── Cache d'un DataFrame réutilisé ────────────────────────
+print("\n=== Optimisation : Cache ===")
+
+t0 = time.time()
+base = caract_s.join(usagers_s, "Num_Acc")
+# Sans cache : recalculé deux fois
+r1 = base.filter(F.col("grav") == 2).count()
+r2 = base.filter(F.col("atm") == 1).count()
+t1 = time.time()
+print(f"Temps SANS cache : {t1-t0:.2f}s  (tués={r1}, atm_normale={r2})")
+
+t0 = time.time()
+base_cached = caract_s.join(usagers_s, "Num_Acc").cache()
+base_cached.count()  # matérialise le cache
+r1 = base_cached.filter(F.col("grav") == 2).count()
+r2 = base_cached.filter(F.col("atm") == 1).count()
+t1 = time.time()
+print(f"Temps AVEC cache  : {t1-t0:.2f}s  (tués={r1}, atm_normale={r2})")
+base_cached.unpersist()
+
+# ══════════════════════════════════════════════════════════
+# ÉTAPE 6 — EXPLORATION AQE
+# ══════════════════════════════════════════════════════════
+print("\n=== Exploration AQE : effet du nombre de partitions ===")
+
+# AQE activé (défaut)
+spark.conf.set("spark.sql.adaptive.enabled", "true")
+
+partitions_test = [4, 8, 20, 200]
+
+for n in partitions_test:
+    spark.conf.set("spark.sql.shuffle.partitions", str(n))
+    t0 = time.time()
+    result = caract_s.join(usagers_s, "Num_Acc") \
+        .groupBy("dep", "mois") \
+        .agg(F.count("*").alias("nb_victimes"),
+             F.sum(F.when(F.col("grav") == 2, 1).otherwise(0)).alias("nb_tues")) \
+        .orderBy(F.desc("nb_victimes"))
+    result.write.mode("overwrite").parquet(f"{GOLD}/aqe_test_{n}")
+    t1 = time.time()
+    print(f"  shuffle.partitions={n:3d}  →  {t1-t0:.2f}s")
+
+# AQE désactivé pour comparaison
+spark.conf.set("spark.sql.adaptive.enabled", "false")
+spark.conf.set("spark.sql.shuffle.partitions", "200")
+t0 = time.time()
+result = caract_s.join(usagers_s, "Num_Acc") \
+    .groupBy("dep", "mois") \
+    .agg(F.count("*").alias("nb_victimes"),
+         F.sum(F.when(F.col("grav") == 2, 1).otherwise(0)).alias("nb_tues")) \
+    .orderBy(F.desc("nb_victimes"))
+result.write.mode("overwrite").parquet(f"{GOLD}/aqe_off_200")
+t1 = time.time()
+print(f"  AQE désactivé, partitions=200  →  {t1-t0:.2f}s")
+
+print("\n=== Pipeline complet terminé ===")
 
 spark.stop()
