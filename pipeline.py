@@ -1,14 +1,11 @@
 from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
-from pyspark.sql.types import (
-    StructType, StructField,
-    StringType, IntegerType, FloatType
-)
+from pyspark.sql.functions import broadcast
+from pyspark.sql.window import Window
+from pyspark.sql.types import StructType, StructField, StringType, IntegerType, FloatType
 import time
-import os
 
 
-# ── Session Spark ──────────────────────────────────────────
 spark = SparkSession.builder \
     .appName("ONISR_2024_Pipeline") \
     .config("spark.ui.port", "4040") \
@@ -20,21 +17,16 @@ spark = SparkSession.builder \
 
 spark.sparkContext.setLogLevel("WARN")
 
-
-
-# Contournement winutils Windows
 spark.sparkContext._jsc.hadoopConfiguration().set(
     "mapreduce.fileoutputcommitter.marksuccessfuljobs", "false"
 )
 
-# ── Chemins ────────────────────────────────────────────────
 RAW    = r"C:\Users\Boly-\Desktop\data_p\raw"
 SILVER = r"C:\Users\Boly-\Desktop\data_p\silver"
 GOLD   = r"C:\Users\Boly-\Desktop\data_p\gold"
 
-# ══════════════════════════════════════════════════════════
-# ÉTAPE 1 — INGESTION (Bronze → Silver)
-# ══════════════════════════════════════════════════════════
+
+# Etape 1 : Lecture des fichiers bruts avec schéma explicite
 
 schema_caract = StructType([
     StructField("Num_Acc", StringType(),  True),
@@ -108,7 +100,6 @@ schema_usagers = StructType([
     StructField("etatp",       IntegerType(), True),
 ])
 
-# ── Lecture CSV ────────────────────────────────────────────
 def read_csv(path, schema):
     return spark.read \
         .option("header", "true") \
@@ -118,24 +109,24 @@ def read_csv(path, schema):
         .schema(schema) \
         .csv(path)
 
-print("=== Lecture des fichiers bruts ===")
+print("Lecture des fichiers bruts")
 caract    = read_csv(f"{RAW}/caract-2024.csv",    schema_caract)
 lieux     = read_csv(f"{RAW}/lieux-2024.csv",     schema_lieux)
 vehicules = read_csv(f"{RAW}/vehicules-2024.csv", schema_vehicules)
 usagers   = read_csv(f"{RAW}/usagers-2024.csv",   schema_usagers)
 
-print(f"Lignes brutes caract   : {caract.count()}")
-print(f"Lignes brutes lieux    : {lieux.count()}")
-print(f"Lignes brutes vehicules: {vehicules.count()}")
-print(f"Lignes brutes usagers  : {usagers.count()}")
+print(f"caract   : {caract.count()} lignes")
+print(f"lieux    : {lieux.count()} lignes")
+print(f"vehicules: {vehicules.count()} lignes")
+print(f"usagers  : {usagers.count()} lignes")
 
 caract.show(3)
 usagers.show(3)
 
-# ══════════════════════════════════════════════════════════
-# ÉTAPE 2 — NETTOYAGE
-# ══════════════════════════════════════════════════════════
-print("\n=== Nettoyage ===")
+
+# Etape 2 : Nettoyage des données
+
+print("Nettoyage en cours...")
 
 caract_clean = caract \
     .withColumn("heure", F.split(F.col("hrmn"), ":")[0].cast(IntegerType())) \
@@ -162,47 +153,36 @@ print(f"lieux     après nettoyage : {lieux_clean.count()}")
 print(f"vehicules après nettoyage : {vehicules_clean.count()}")
 print(f"usagers   après nettoyage : {usagers_clean.count()}")
 
-# ══════════════════════════════════════════════════════════
-# ÉTAPE 3 — ÉCRITURE SILVER (Parquet)
-# ══════════════════════════════════════════════════════════
-print("\n=== Écriture Silver (Parquet) ===")
 
-caract_clean.write.mode("overwrite") \
-    .partitionBy("mois") \
-    .parquet(f"{SILVER}/caract")
+# Etape 3 : Ecriture de la couche Silver en Parquet
 
-lieux_clean.write.mode("overwrite") \
-    .parquet(f"{SILVER}/lieux")
+print("Ecriture Silver...")
 
-vehicules_clean.write.mode("overwrite") \
-    .parquet(f"{SILVER}/vehicules")
+caract_clean.write.mode("overwrite").partitionBy("mois").parquet(f"{SILVER}/caract")
+lieux_clean.write.mode("overwrite").parquet(f"{SILVER}/lieux")
+vehicules_clean.write.mode("overwrite").parquet(f"{SILVER}/vehicules")
+usagers_clean.write.mode("overwrite").partitionBy("grav").parquet(f"{SILVER}/usagers")
 
-usagers_clean.write.mode("overwrite") \
-    .partitionBy("grav") \
-    .parquet(f"{SILVER}/usagers")
+print("Silver écrit avec succès")
 
-print("✅ Silver écrit avec succès !")
-print("\n=== Ingestion terminée ===")
 
-# ══════════════════════════════════════════════════════════
-# ÉTAPE 4 — ANALYSES (Silver → Gold)
-# ══════════════════════════════════════════════════════════
+# Etape 4 : Analyses sur la couche Silver
 
-# Relire la couche silver
-print("\n=== Lecture Silver ===")
+print("Lecture de la couche Silver")
 caract_s    = spark.read.parquet(f"{SILVER}/caract")
 lieux_s     = spark.read.parquet(f"{SILVER}/lieux")
 vehicules_s = spark.read.parquet(f"{SILVER}/vehicules")
 usagers_s   = spark.read.parquet(f"{SILVER}/usagers")
 
-# ── ANALYSE 1 : Gravité par conditions météo (agrégation) ──
-print("\n=== Analyse 1 : Gravité par météo ===")
-# atm : 1=normale, 2=pluie légère, 3=pluie forte, 4=neige, 5=brouillard, etc.
+
+# Analyse 1 : gravité des accidents selon la météo
+# atm : 1=normale, 2=pluie légère, 3=pluie forte, 4=neige, 5=brouillard
 # grav : 1=indemne, 2=tué, 3=blessé hospitalisé, 4=blessé léger
 
+print("Analyse 1 : gravité par météo")
 t0 = time.time()
 
-gravite_meteo = caract_s.join(usagers_s, "Num_Acc") \
+stats_meteo = caract_s.join(usagers_s, "Num_Acc") \
     .groupBy("atm") \
     .agg(
         F.count("*").alias("nb_victimes"),
@@ -212,77 +192,72 @@ gravite_meteo = caract_s.join(usagers_s, "Num_Acc") \
     .orderBy("atm")
 
 t1 = time.time()
-print(f"Temps analyse 1 : {t1-t0:.2f}s")
-gravite_meteo.show(10)
-gravite_meteo.write.mode("overwrite").parquet(f"{GOLD}/gravite_meteo")
+print(f"Temps : {t1-t0:.2f}s")
+stats_meteo.show(10)
+stats_meteo.write.mode("overwrite").parquet(f"{GOLD}/gravite_meteo")
 
-# ── ANALYSE 2 : Jointure des 4 tables — profil complet ────
-print("\n=== Analyse 2 : Jointure 4 tables ===")
 
+# Analyse 2 : accidents mortels par type de route et luminosité (jointure 4 tables)
+# lieux est broadcasté car c'est la plus petite table
+
+print("Analyse 2 : jointure 4 tables")
 t0 = time.time()
 
-# Broadcast de lieux (petite table) pour optimisation
-from pyspark.sql.functions import broadcast
-
-accidents_complets = caract_s \
+df_joint = caract_s \
     .join(broadcast(lieux_s), "Num_Acc") \
     .join(vehicules_s, "Num_Acc") \
     .join(usagers_s, "Num_Acc")
 
-# Accidents mortels par type de route et luminosité
-accidents_mortels = accidents_complets \
+accidents_mortels = df_joint \
     .filter(F.col("grav") == 2) \
     .groupBy("catr", "lum") \
     .agg(F.count("*").alias("nb_tues")) \
     .orderBy(F.desc("nb_tues"))
 
 t1 = time.time()
-print(f"Temps analyse 2 : {t1-t0:.2f}s")
+print(f"Temps : {t1-t0:.2f}s")
 accidents_mortels.show(10)
 accidents_mortels.write.mode("overwrite").parquet(f"{GOLD}/accidents_mortels")
 
-# ── ANALYSE 3 : Classement des départements (window) ──────
-print("\n=== Analyse 3 : Classement départements (window) ===")
-from pyspark.sql.window import Window
 
+# Analyse 3 : classement des départements avec window function
+
+print("Analyse 3 : classement des départements")
 t0 = time.time()
 
-# Nombre d'accidents et tués par département
-dep_stats = caract_s.join(usagers_s, "Num_Acc") \
+accidents_par_dep = caract_s.join(usagers_s, "Num_Acc") \
     .groupBy("dep") \
     .agg(
         F.countDistinct("Num_Acc").alias("nb_accidents"),
         F.sum(F.when(F.col("grav") == 2, 1).otherwise(0)).alias("nb_tues")
     )
 
-# Window : rang par nb_accidents
 window_dep = Window.orderBy(F.desc("nb_accidents"))
 
-dep_classe = dep_stats \
+dep_classe = accidents_par_dep \
     .withColumn("rang", F.rank().over(window_dep)) \
     .withColumn("taux_mortalite",
-        F.round(F.when(F.col("nb_accidents") > 0,
-            F.col("nb_tues") / F.col("nb_accidents") * 100
-        ).otherwise(0), 2)
+        F.round(
+            F.when(F.col("nb_accidents") > 0,
+                F.col("nb_tues") / F.col("nb_accidents") * 100
+            ).otherwise(0), 2)
     ) \
     .orderBy("rang")
 
 t1 = time.time()
-print(f"Temps analyse 3 : {t1-t0:.2f}s")
+print(f"Temps : {t1-t0:.2f}s")
 dep_classe.show(15)
 dep_classe.write.mode("overwrite").parquet(f"{GOLD}/classement_departements")
 
-print("\n=== Analyses terminées, résultats écrits dans Gold ===")
+print("Analyses terminées")
 
 
-# ══════════════════════════════════════════════════════════
-# ÉTAPE 5 — OPTIMISATION MESURÉE
-# ══════════════════════════════════════════════════════════
-print("\n=== Optimisation : Broadcast Join ===")
+# Etape 5 : Optimisation mesurée
 
-# -- SANS broadcast (sort-merge join par défaut)
-spark.conf.set("spark.sql.autoBroadcastJoinThreshold", "-1")  # désactive broadcast auto
+# Test broadcast join : on désactive d'abord le broadcast automatique
+print("Optimisation : broadcast join")
 
+spark.conf.set("spark.sql.autoBroadcastJoinThreshold", "-1")
 t0 = time.time()
 sans_broadcast = caract_s.join(lieux_s, "Num_Acc") \
     .groupBy("dep", "catr") \
@@ -291,11 +266,9 @@ sans_broadcast = caract_s.join(lieux_s, "Num_Acc") \
 sans_broadcast.write.mode("overwrite").parquet(f"{GOLD}/test_sans_broadcast")
 t1 = time.time()
 temps_sans = t1 - t0
-print(f"Temps SANS broadcast : {temps_sans:.2f}s")
+print(f"Sans broadcast : {temps_sans:.2f}s")
 
-# -- AVEC broadcast (lieux est petit ~54K lignes)
-spark.conf.set("spark.sql.autoBroadcastJoinThreshold", "10485760")  # réactive
-
+spark.conf.set("spark.sql.autoBroadcastJoinThreshold", "10485760")
 t0 = time.time()
 avec_broadcast = caract_s.join(broadcast(lieux_s), "Num_Acc") \
     .groupBy("dep", "catr") \
@@ -304,41 +277,39 @@ avec_broadcast = caract_s.join(broadcast(lieux_s), "Num_Acc") \
 avec_broadcast.write.mode("overwrite").parquet(f"{GOLD}/test_avec_broadcast")
 t1 = time.time()
 temps_avec = t1 - t0
-print(f"Temps AVEC broadcast : {temps_avec:.2f}s")
+print(f"Avec broadcast : {temps_avec:.2f}s")
 print(f"Gain : {((temps_sans - temps_avec) / temps_sans * 100):.1f}%")
 
-# -- Plan d'exécution (pour le rapport)
-print("\n--- Plan SANS broadcast ---")
+print("Plan sans broadcast :")
 caract_s.join(lieux_s, "Num_Acc").explain()
-print("\n--- Plan AVEC broadcast ---")
+print("Plan avec broadcast :")
 caract_s.join(broadcast(lieux_s), "Num_Acc").explain()
 
-# ── Cache d'un DataFrame réutilisé ────────────────────────
-print("\n=== Optimisation : Cache ===")
+# Test cache : on réutilise la même jointure deux fois
+print("Optimisation : cache")
 
 t0 = time.time()
 base = caract_s.join(usagers_s, "Num_Acc")
-# Sans cache : recalculé deux fois
 r1 = base.filter(F.col("grav") == 2).count()
 r2 = base.filter(F.col("atm") == 1).count()
 t1 = time.time()
-print(f"Temps SANS cache : {t1-t0:.2f}s  (tués={r1}, atm_normale={r2})")
+print(f"Sans cache : {t1-t0:.2f}s  (tués={r1}, atm_normale={r2})")
 
 t0 = time.time()
 base_cached = caract_s.join(usagers_s, "Num_Acc").cache()
-base_cached.count()  # matérialise le cache
+base_cached.count()
 r1 = base_cached.filter(F.col("grav") == 2).count()
 r2 = base_cached.filter(F.col("atm") == 1).count()
 t1 = time.time()
-print(f"Temps AVEC cache  : {t1-t0:.2f}s  (tués={r1}, atm_normale={r2})")
+print(f"Avec cache : {t1-t0:.2f}s  (tués={r1}, atm_normale={r2})")
 base_cached.unpersist()
 
-# ══════════════════════════════════════════════════════════
-# ÉTAPE 6 — EXPLORATION AQE
-# ══════════════════════════════════════════════════════════
-print("\n=== Exploration AQE : effet du nombre de partitions ===")
 
-# AQE activé (défaut)
+# Etape 6 : Exploration AQE
+# J'ai testé plusieurs valeurs pour comprendre l'effet de ce paramètre sur les performances
+
+print("Exploration AQE : effet du nombre de partitions")
+
 spark.conf.set("spark.sql.adaptive.enabled", "true")
 
 partitions_test = [4, 8, 20, 200]
@@ -348,26 +319,30 @@ for n in partitions_test:
     t0 = time.time()
     result = caract_s.join(usagers_s, "Num_Acc") \
         .groupBy("dep", "mois") \
-        .agg(F.count("*").alias("nb_victimes"),
-             F.sum(F.when(F.col("grav") == 2, 1).otherwise(0)).alias("nb_tues")) \
+        .agg(
+            F.count("*").alias("nb_victimes"),
+            F.sum(F.when(F.col("grav") == 2, 1).otherwise(0)).alias("nb_tues")
+        ) \
         .orderBy(F.desc("nb_victimes"))
     result.write.mode("overwrite").parquet(f"{GOLD}/aqe_test_{n}")
     t1 = time.time()
-    print(f"  shuffle.partitions={n:3d}  →  {t1-t0:.2f}s")
+    print(f"  partitions={n}  →  {t1-t0:.2f}s")
 
-# AQE désactivé pour comparaison
+# Même test avec AQE désactivé pour voir la différence
 spark.conf.set("spark.sql.adaptive.enabled", "false")
 spark.conf.set("spark.sql.shuffle.partitions", "200")
 t0 = time.time()
 result = caract_s.join(usagers_s, "Num_Acc") \
     .groupBy("dep", "mois") \
-    .agg(F.count("*").alias("nb_victimes"),
-         F.sum(F.when(F.col("grav") == 2, 1).otherwise(0)).alias("nb_tues")) \
+    .agg(
+        F.count("*").alias("nb_victimes"),
+        F.sum(F.when(F.col("grav") == 2, 1).otherwise(0)).alias("nb_tues")
+    ) \
     .orderBy(F.desc("nb_victimes"))
 result.write.mode("overwrite").parquet(f"{GOLD}/aqe_off_200")
 t1 = time.time()
 print(f"  AQE désactivé, partitions=200  →  {t1-t0:.2f}s")
 
-print("\n=== Pipeline complet terminé ===")
+print("Pipeline complet terminé")
 
 spark.stop()
