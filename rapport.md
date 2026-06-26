@@ -169,6 +169,11 @@ Les captures montrent :
 
 Le shuffle apparaît systématiquement après les `join` et `groupBy` : Spark doit redistribuer les lignes par clé avant d'agréger.
 
+![Jobs](images/Capture_d_écran_2026-06-26_124815.png)
+![Stages](images/Capture_d_écran_2026-06-26_124830.png)
+![SQL DataFrame](images/Capture_d_écran_2026-06-26_124846.png)
+![Job 23 détail](images/Capture_d_écran_2026-06-26_125049.png)
+
 ---
 
 ## 6. Exploration AQE — Effet du nombre de partitions de shuffle
